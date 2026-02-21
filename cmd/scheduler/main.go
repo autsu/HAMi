@@ -90,7 +90,29 @@ func init() {
 	rootCmd.Flags().AddGoFlagSet(util.InitKlogFlags())
 }
 
-// injectProfilingRoute injects pprof routes into the router.
+// injectProfilingRoute 注入性能分析路由
+// 用于运行时性能诊断
+//
+// 功能说明：
+// - 注册 pprof 的各种分析接口
+// - 支持 CPU、内存、goroutine 等分析
+//
+// 可用的分析接口：
+// - /debug/pprof/: 概览页面
+// - /debug/pprof/cmdline: 命令行参数
+// - /debug/pprof/profile: CPU 性能分析（30秒采样）
+// - /debug/pprof/symbol: 符号表查询
+// - /debug/pprof/trace: 执行追踪
+// - /debug/pprof/heap: 堆内存分析
+// - /debug/pprof/goroutine: goroutine 堆栈
+//
+// 安全注意事项：
+// - 生产环境谨慎启用
+// - 可能暴露敏感信息
+// - 建议只在内网访问
+//
+// 参数：
+// - router: HTTP 路由器
 func injectProfilingRoute(router *httprouter.Router) {
 	router.GET("/debug/pprof/*suffix", func(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 		suffix := params.ByName("suffix")
@@ -109,6 +131,48 @@ func injectProfilingRoute(router *httprouter.Router) {
 	})
 }
 
+// +scheduler:entry
+// start 启动调度器服务
+// 这是整个调度系统的启动入口
+//
+// 启动流程：
+// 1. 初始化配置：节点锁超时、Kubernetes 客户端
+// 2. 初始化设备：加载设备配置，注册设备类型
+// 3. 创建调度器：NewScheduler() 创建核心调度器实例
+// 4. 启动后台任务：
+//   - RegisterFromNodeAnnotations: 持续监听节点变化
+//   - Start: 启动 Informer 和事件处理器
+//
+// 5. 启动监控：Prometheus 指标服务
+// 6. 启动 HTTP 服务：注册路由，监听请求
+//
+// 为什么要先初始化设备？
+// - 调度器需要知道支持哪些设备类型
+// - 设备配置决定了资源名称和调度策略
+// - 提前加载避免运行时错误
+//
+// 为什么 RegisterFromNodeAnnotations 要在 goroutine 中？
+// - 这是一个无限循环的后台任务
+// - 不能阻塞主流程
+// - 持续监听节点变化并更新状态
+//
+// 为什么要 defer sher.Stop()？
+// - 确保优雅退出时清理资源
+// - 关闭 Informer 和 goroutine
+// - 避免资源泄漏
+//
+// HTTP vs HTTPS：
+// - 如果提供了证书，启动 HTTPS 服务
+// - 使用 certwatcher 支持证书热重载
+// - 生产环境建议使用 HTTPS
+//
+// Profiling 的作用：
+// - 启用后可以访问 /debug/pprof/ 查看性能分析
+// - 用于排查性能问题和内存泄漏
+// - 生产环境谨慎启用（有安全风险）
+//
+// 返回值：
+// - error: 启动过程中的错误
 func start() error {
 	// Initialize node lock timeout from config
 	nodelock.NodeLockTimeout = config.NodeLockTimeout

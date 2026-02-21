@@ -39,6 +39,22 @@ type webhook struct {
 	decoder admission.Decoder
 }
 
+//+scheduler:1
+// NewWebHook 创建一个新的 Webhook 处理器
+// 这是调度流程的第一步：Pod 准入控制
+// 
+// 功能说明：
+// 1. 初始化 Kubernetes 对象解码器，用于解析 AdmissionReview 请求
+// 2. 创建 Webhook Handler，处理 Pod 创建/更新请求
+//
+// 为什么需要 Webhook？
+// - 在 Pod 创建时就进行资源验证，避免无效的调度尝试
+// - 自动为需要设备的 Pod 设置正确的 schedulerName
+// - 提前检查资源配额，防止超分
+//
+// 返回值：
+// - *admission.Webhook: 可以注册到 HTTP 路由的 Webhook 处理器
+// - error: 初始化失败时返回错误
 func NewWebHook() (*admission.Webhook, error) {
 	logf.SetLogger(klog.NewKlogr())
 	schema := runtime.NewScheme()
@@ -50,6 +66,33 @@ func NewWebHook() (*admission.Webhook, error) {
 	return wh, nil
 }
 
+//+scheduler:1.1
+// Handle 处理 Pod 的准入请求（Webhook 的核心逻辑）
+// 这是调度流程的第一步：在 Pod 创建时进行验证和修改
+//
+// 处理流程：
+// 1. 解码 AdmissionReview 请求，获取 Pod 对象
+// 2. 基本验证：检查容器列表、调度器名称、特权容器
+// 3. 资源检测：遍历所有容器，检查是否请求了 AI 设备资源
+// 4. 调度器设置：如果需要设备调度，设置 schedulerName 为 HAMi
+// 5. 配额验证：检查命名空间的资源配额是否足够
+// 6. 返回修改：将修改后的 Pod 以 JSON Patch 形式返回
+//
+// 为什么要检查 schedulerName？
+// - 避免覆盖用户明确指定的其他调度器
+// - 只处理需要设备调度的 Pod
+// - 支持多调度器共存
+//
+// 为什么要检查特权容器？
+// - 特权容器可以直接访问所有设备，不需要调度器分配
+// - 避免与 Device Plugin 的设备隔离机制冲突
+//
+// 参数：
+// - ctx: 请求上下文（未使用，保留用于超时控制）
+// - req: Kubernetes AdmissionReview 请求
+//
+// 返回值：
+// - admission.Response: 包含是否允许、错误信息、JSON Patch 的响应
 func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Response {
 	pod := &corev1.Pod{}
 	err := h.decoder.Decode(req, pod)
@@ -108,6 +151,29 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 }
 
+//+scheduler:1.2
+// fitResourceQuota 检查 Pod 是否符合命名空间的资源配额限制
+// 这是准入控制的最后一步验证
+//
+// 功能说明：
+// 1. 遍历 Pod 的所有容器，累加设备资源请求
+// 2. 考虑内存放大因子（MemoryFactor），计算实际内存需求
+// 3. 调用 QuotaManager 检查配额是否足够
+//
+// 为什么需要内存放大因子？
+// - 某些设备（如 NVIDIA GPU）需要额外的系统内存用于驱动和缓冲
+// - 放大因子确保配额检查考虑了这部分隐藏开销
+// - 防止实际使用超过配额限制
+//
+// 为什么只支持 NVIDIA？
+// - 目前只有 NVIDIA 设备配置了内存放大因子
+// - 其他设备可以通过类似方式扩展
+//
+// 参数：
+// - pod: 待检查的 Pod 对象
+//
+// 返回值：
+// - bool: true 表示符合配额，false 表示超出配额
 func fitResourceQuota(pod *corev1.Pod) bool {
 	for deviceName, dev := range device.GetDevices() {
 		// Only supports NVIDIA
