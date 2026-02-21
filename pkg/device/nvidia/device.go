@@ -217,6 +217,24 @@ func FilterDeviceToRegister(uuid, indexStr string) bool {
 	return false
 }
 
+// NodeCleanUp 清理节点的设备相关注解
+// 当设备不健康时调用，标记 HandshakeAnnos 为 "Deleted"
+//
+// 注意：虽然 NVIDIA 的 CheckHealth 不使用 HandshakeAnnos 握手机制，
+// 但仍然需要标记这个注解，原因：
+// 1. 通知 Device Plugin 设备已被 Scheduler 标记为不健康
+// 2. 与其他设备类型保持一致的清理流程
+// 3. 为未来可能的握手机制预留接口
+//
+// 调用时机：
+// - CheckHealth 返回 (false, false) 时
+// - Scheduler 的 register 方法中检测到设备不健康
+//
+// 参数：
+// - nn: 节点名称
+//
+// 返回值：
+// - error: 更新注解失败时返回错误
 func (dev *NvidiaGPUDevices) NodeCleanUp(nn string) error {
 	return util.MarkAnnotationsToDelete(HandshakeAnnos, nn)
 }

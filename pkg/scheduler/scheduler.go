@@ -451,6 +451,7 @@ func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[strin
 					klog.ErrorS(err, "Node cleanup failed", "nodeName", val.Name, "deviceVendor", devhandsk)
 				}
 
+				// 从缓存中，删除节点上对应的设备
 				s.rmNodeDevices(val.Name, devhandsk)
 				continue
 			}
@@ -779,6 +780,7 @@ func (s *Scheduler) Bind(args extenderv1.ExtenderBindingArgs) (*extenderv1.Exten
 	}
 
 	for _, val := range device.GetDevices() {
+		// 针对当前设备，给节点上锁，其实就是打一个特殊的 anno
 		err = val.LockNode(node, current)
 		if err != nil {
 			klog.ErrorS(err, "Failed to lock node", "node", args.Node, "device", val)

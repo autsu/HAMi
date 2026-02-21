@@ -132,6 +132,7 @@ func (m *nodeManager) rmNodeDevices(nodeID string, deviceVendor string) {
 	if nodeInfo == nil {
 		return
 	}
+	// 删除 node 上的设备信息
 	delete(m.nodes[nodeID].Devices, deviceVendor)
 	if len(m.nodes[nodeID].Devices) == 0 {
 		delete(m.nodes, nodeID)

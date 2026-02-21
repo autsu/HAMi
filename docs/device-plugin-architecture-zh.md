@@ -111,52 +111,288 @@ func (m *NvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Device
 
 ### 3. 设备分配（Allocate）
 
-当 Pod 被调度到节点后，kubelet 调用 Device Plugin 的 `Allocate` 方法：
+当 Pod 被调度到节点后，kubelet 调用 Device Plugin 的 `Allocate` 方法。这是 HAMi 最核心的方法，实现了与 Scheduler 的协作和资源隔离。
+
+#### 真实的 Allocate 流程（基于源码）
 
 ```go
-func (m *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
-    responses := pluginapi.AllocateResponse{}
+// pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go:475
+func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *kubeletdevicepluginv1beta1.AllocateRequest) (*kubeletdevicepluginv1beta1.AllocateResponse, error) {
+    responses := kubeletdevicepluginv1beta1.AllocateResponse{}
+    nodename := os.Getenv(util.NodeNameEnvName)
     
-    for _, req := range reqs.ContainerRequests {
-        // 1. 读取 Pod 注解，获取 Scheduler 的分配决策
-        podAnnotations := getPodAnnotations(ctx)
-        allocatedDevices := podAnnotations["hami.io/vgpu-devices-to-allocate"]
-        
-        // 2. 解析分配的设备 UUID
-        deviceUUIDs := parseDeviceAllocation(allocatedDevices)
-        
-        // 3. 构造容器响应
-        response := &pluginapi.ContainerAllocateResponse{
-            Envs: map[string]string{
-                // 设置可见的 GPU
-                "NVIDIA_VISIBLE_DEVICES": strings.Join(deviceUUIDs, ","),
-                // 设置显存限制（通过 vGPU 库）
-                "CUDA_DEVICE_MEMORY_LIMIT": getMemoryLimit(allocatedDevices),
-                // 设置算力限制
-                "CUDA_DEVICE_SM_LIMIT": getCoreLimit(allocatedDevices),
-            },
-            Mounts: []*pluginapi.Mount{
-                // 挂载 vGPU 库
-                {
-                    ContainerPath: "/usr/local/vgpu",
-                    HostPath:      "/usr/local/vgpu",
-                    ReadOnly:      true,
-                },
-            },
-        }
-        
-        responses.ContainerResponses = append(responses.ContainerResponses, response)
+    // 步骤 1: 获取当前正在分配的 Pod
+    current, err := util.GetPendingPod(ctx, nodename)
+    if err != nil {
+        return &kubeletdevicepluginv1beta1.AllocateResponse{}, err
     }
+    klog.Infof("Allocate pod name is %s/%s, annotation is %+v", current.Namespace, current.Name, current.Annotations)
+
+    // 步骤 2: 遍历每个容器的设备请求
+    for idx, req := range reqs.ContainerRequests {
+        // 分支 1: MIG 模式的处理
+        if strings.Contains(req.DevicesIDs[0], "MIG") {
+            // MIG 设备的分配逻辑（较简单，直接使用 kubelet 传入的设备 ID）
+            response, err := plugin.getAllocateResponse(req.DevicesIDs)
+            responses.ContainerResponses = append(responses.ContainerResponses, response)
+        } else {
+            // 分支 2: 普通 GPU 模式（HAMi 的核心逻辑）
+            
+            // 2.1 从 Pod 注解读取 Scheduler 的分配决策
+            currentCtr, devreq, err := GetNextDeviceRequest(nvidia.NvidiaGPUDevice, *current)
+            klog.Infoln("deviceAllocateFromAnnotation=", devreq)
+            
+            // 2.2 验证设备数量是否匹配
+            if len(devreq) != len(reqs.ContainerRequests[idx].DevicesIDs) {
+                PodAllocationFailed(nodename, current, NodeLockNvidia)
+                return &kubeletdevicepluginv1beta1.AllocateResponse{}, errors.New("device number not matched")
+            }
+            
+            // 2.3 获取基础的分配响应（设置 NVIDIA_VISIBLE_DEVICES）
+            response, err := plugin.getAllocateResponse(plugin.GetContainerDeviceStrArray(devreq))
+            
+            // 2.4 从注解中删除已处理的设备请求（避免重复处理）
+            err = EraseNextDeviceTypeFromAnnotation(nvidia.NvidiaGPUDevice, *current)
+            
+            // 2.5 非 MIG 模式：注入 vGPU 资源隔离
+            if plugin.operatingMode != "mig" {
+                // 设置每个 GPU 的显存限制
+                for i, dev := range devreq {
+                    limitKey := fmt.Sprintf("CUDA_DEVICE_MEMORY_LIMIT_%v", i)
+                    response.Envs[limitKey] = fmt.Sprintf("%vm", dev.Usedmem)
+                }
+                
+                // 设置算力限制
+                response.Envs["CUDA_DEVICE_SM_LIMIT"] = fmt.Sprint(devreq[0].Usedcores)
+                
+                // 设置缓存文件路径
+                response.Envs["CUDA_DEVICE_MEMORY_SHARED_CACHE"] = fmt.Sprintf("%s/vgpu/%v.cache", hostHookPath, uuid.New().String())
+                
+                // 显存超分配标志
+                if *plugin.schedulerConfig.DeviceMemoryScaling > 1 {
+                    response.Envs["CUDA_OVERSUBSCRIBE"] = "true"
+                }
+                
+                // 日志级别
+                if *plugin.schedulerConfig.LogLevel != "" {
+                    response.Envs["LIBCUDA_LOG_LEVEL"] = string(*plugin.schedulerConfig.LogLevel)
+                }
+                
+                // 算力限制开关
+                if plugin.schedulerConfig.DisableCoreLimit {
+                    response.Envs[util.CoreLimitSwitch] = "disable"
+                }
+                
+                // 创建容器专属的缓存目录
+                cacheFileHostDirectory := fmt.Sprintf("%s/vgpu/containers/%s_%s", hostHookPath, current.UID, currentCtr.Name)
+                os.RemoveAll(cacheFileHostDirectory)
+                os.MkdirAll(cacheFileHostDirectory, 0777)
+                
+                // 挂载 vGPU 库和缓存目录
+                response.Mounts = append(response.Mounts,
+                    &kubeletdevicepluginv1beta1.Mount{
+                        ContainerPath: fmt.Sprintf("%s/vgpu/libvgpu.so", hostHookPath),
+                        HostPath:      GetLibPath(),  // 实际路径：/usr/local/vgpu/libvgpu.so.vX.X.X
+                        ReadOnly:      true,
+                    },
+                    &kubeletdevicepluginv1beta1.Mount{
+                        ContainerPath: fmt.Sprintf("%s/vgpu", hostHookPath),
+                        HostPath:      cacheFileHostDirectory,
+                        ReadOnly:      false,
+                    },
+                    &kubeletdevicepluginv1beta1.Mount{
+                        ContainerPath: "/tmp/vgpulock",
+                        HostPath:      "/tmp/vgpulock",
+                        ReadOnly:      false,
+                    },
+                )
+                
+                // 检查是否禁用 vGPU 控制（通过容器环境变量 CUDA_DISABLE_CONTROL）
+                found := false
+                for _, val := range currentCtr.Env {
+                    if val.Name == "CUDA_DISABLE_CONTROL" {
+                        if t, _ := strconv.ParseBool(val.Value); t {
+                            found = true
+                            break
+                        }
+                    }
+                }
+                
+                // 如果未禁用，挂载 ld.so.preload（注入 vGPU 库）
+                if !found {
+                    response.Mounts = append(response.Mounts, 
+                        &kubeletdevicepluginv1beta1.Mount{
+                            ContainerPath: "/etc/ld.so.preload",
+                            HostPath:      hostHookPath + "/vgpu/ld.so.preload",
+                            ReadOnly:      true,
+                        },
+                    )
+                }
+                
+                // 如果存在 license 文件，也挂载进去
+                if _, err := os.Stat(fmt.Sprintf("%s/vgpu/license", hostHookPath)); err == nil {
+                    response.Mounts = append(response.Mounts, 
+                        &kubeletdevicepluginv1beta1.Mount{
+                            ContainerPath: "/tmp/license",
+                            HostPath:      fmt.Sprintf("%s/vgpu/license", hostHookPath),
+                            ReadOnly:      true,
+                        },
+                        &kubeletdevicepluginv1beta1.Mount{
+                            ContainerPath: "/usr/bin/vgpuvalidator",
+                            HostPath:      fmt.Sprintf("%s/vgpu/vgpuvalidator", hostHookPath),
+                            ReadOnly:      true,
+                        },
+                    )
+                }
+            }
+            
+            responses.ContainerResponses = append(responses.ContainerResponses, response)
+        }
+    }
+    
+    // 步骤 3: 检查是否所有设备都已分配完成，如果是则释放节点锁
+    PodAllocationTrySuccess(nodename, nvidia.NvidiaGPUDevice, NodeLockNvidia, current)
     
     return &responses, nil
 }
 ```
 
-**作用**：
-- 读取 Scheduler 写入的设备分配注解
-- 设置容器环境变量（`NVIDIA_VISIBLE_DEVICES` 等）
-- 挂载必要的文件和库（vGPU 库、设备文件）
-- 实现细粒度资源隔离（显存、算力限制）
+#### 关键辅助函数
+
+**1. GetNextDeviceRequest - 从注解读取设备分配**
+
+```go
+// pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go:52
+func GetNextDeviceRequest(dtype string, p corev1.Pod) (corev1.Container, device.ContainerDevices, error) {
+    // 解码 Pod 注解中的设备分配信息
+    // 注解格式：hami.io/vgpu-devices-to-allocate: "GPU-uuid-1,NVIDIA,4096,50:GPU-uuid-2,NVIDIA,4096,50;..."
+    pdevices, err := device.DecodePodDevices(device.InRequestDevices, p.Annotations)
+    if err != nil {
+        return corev1.Container{}, device.ContainerDevices{}, err
+    }
+    
+    // 获取指定设备类型的分配信息
+    pd, ok := pdevices[dtype]
+    if !ok {
+        return corev1.Container{}, device.ContainerDevices{}, errors.New("device request not found")
+    }
+    
+    // 找到第一个有设备请求的容器
+    for ctridx, ctrDevice := range pd {
+        if len(ctrDevice) > 0 {
+            return p.Spec.Containers[ctridx], ctrDevice, nil
+        }
+    }
+    
+    return corev1.Container{}, device.ContainerDevices{}, errors.New("device request not found")
+}
+```
+
+**2. EraseNextDeviceTypeFromAnnotation - 删除已处理的设备请求**
+
+```go
+// pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go:72
+func EraseNextDeviceTypeFromAnnotation(dtype string, p corev1.Pod) error {
+    // 读取当前注解
+    pdevices, err := device.DecodePodDevices(device.InRequestDevices, p.Annotations)
+    if err != nil {
+        return err
+    }
+    
+    // 找到第一个有设备的容器，将其设备列表清空
+    pd, ok := pdevices[dtype]
+    if !ok {
+        return errors.New("erase device annotation not found")
+    }
+    
+    res := device.PodSingleDevice{}
+    found := false
+    for _, val := range pd {
+        if found {
+            res = append(res, val)
+        } else {
+            if len(val) > 0 {
+                found = true
+                res = append(res, device.ContainerDevices{})  // 清空已处理的容器
+            } else {
+                res = append(res, val)
+            }
+        }
+    }
+    
+    // 更新 Pod 注解
+    newannos := make(map[string]string)
+    newannos[device.InRequestDevices[dtype]] = device.EncodePodSingleDevice(res)
+    return util.PatchPodAnnotations(&p, newannos)
+}
+```
+
+**3. PodAllocationTrySuccess - 检查是否所有设备都已分配**
+
+```go
+// pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go:440
+func PodAllocationTrySuccess(nodeName string, devName string, lockName string, pod *corev1.Pod) {
+    // 重新获取 Pod（确保注解是最新的）
+    refreshed, err := client.GetClient().CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+    if err != nil {
+        return
+    }
+    
+    // 检查注解中是否还有待分配的设备
+    annos := refreshed.Annotations[device.InRequestDevices[devName]]
+    for _, val := range device.DevicesToHandle {
+        if strings.Contains(annos, val) {
+            return  // 还有其他设备类型未分配，不释放锁
+        }
+    }
+    
+    // 所有设备都已分配完成，释放节点锁
+    klog.Infof("All devices allocate success, releasing lock")
+    PodAllocationSuccess(nodeName, pod, lockName)
+}
+```
+
+#### 核心设计要点
+
+**1. 与 Scheduler 的协作**
+- Scheduler 将分配决策写入 Pod 注解：`hami.io/vgpu-devices-to-allocate`
+- Device Plugin 读取注解，获取要分配的设备 UUID、显存、算力
+- 处理完一个容器后，从注解中删除该容器的设备信息
+- 所有容器处理完后，释放节点锁
+
+**2. 注解格式**
+```
+hami.io/vgpu-devices-to-allocate: "GPU-uuid-1,NVIDIA,4096,50:GPU-uuid-2,NVIDIA,4096,50;GPU-uuid-3,NVIDIA,2048,30"
+                                   └─────────── 容器1的设备 ──────────┘ └────── 容器2的设备 ─────┘
+                                   
+格式说明：
+- 使用 ";" 分隔不同容器的设备
+- 使用 ":" 分隔同一容器的多个设备
+- 每个设备：UUID,类型,显存(MB),算力(%)
+```
+
+**3. 资源隔离机制**
+- 通过环境变量传递资源限制：
+  - `CUDA_DEVICE_MEMORY_LIMIT_0=4096m`：限制 GPU 0 的显存
+  - `CUDA_DEVICE_SM_LIMIT=50`：限制算力为 50%
+- 通过 `LD_PRELOAD` 注入 vGPU 库：
+  - 挂载 `/etc/ld.so.preload` 指向 vGPU 配置
+  - 容器启动时自动加载 `libvgpu.so`
+  - vGPU 库拦截 CUDA API，实现资源限制
+
+**4. 容器隔离**
+- 每个容器有独立的缓存目录：`/usr/local/vgpu/containers/{pod-uid}_{container-name}`
+- 避免不同容器之间的资源冲突
+- 支持同一 Pod 的多个容器使用不同的 GPU
+
+**作用总结**：
+- ✅ 读取 Scheduler 写入的设备分配注解
+- ✅ 设置容器环境变量（`NVIDIA_VISIBLE_DEVICES`、`CUDA_DEVICE_MEMORY_LIMIT_*`、`CUDA_DEVICE_SM_LIMIT`）
+- ✅ 挂载 vGPU 库和配置文件（`libvgpu.so`、`ld.so.preload`）
+- ✅ 创建容器专属的缓存目录
+- ✅ 实现细粒度资源隔离（显存、算力限制）
+- ✅ 支持多容器、多设备类型的复杂场景
+- ✅ 处理完成后释放节点锁
 
 ### 4. 资源隔离实现
 
@@ -470,45 +706,168 @@ func (m *NvidiaDevicePlugin) getDeviceNUMA(device nvml.Device) int {
 
 ### 4. 健康检查
 
+**实际的健康检查逻辑**（基于源码 `pkg/device/nvidia/device.go:288` 和 `pkg/scheduler/scheduler.go:register`）：
+
+HAMi 的健康检查**不是**在 Device Plugin 中实现的，而是在 **Scheduler 的 register 方法**中定期调用。
+
 ```go
-func (m *NvidiaDevicePlugin) healthCheck() {
-    ticker := time.NewTicker(30 * time.Second)
-    defer ticker.Stop()
+// pkg/scheduler/scheduler.go:register
+func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[string]bool) {
+    // 获取所有节点
+    rawNodes, _ := s.nodeLister.List(labelSelector)
     
-    for {
-        select {
-        case <-ticker.C:
-            unhealthy := make([]string, 0)
-            
-            for _, dev := range m.devices {
-                device, err := nvml.DeviceGetHandleByUUID(dev.ID)
-                if err != nil {
-                    unhealthy = append(unhealthy, dev.ID)
-                    continue
-                }
-                
-                // 检查设备状态
-                temp, _ := device.GetTemperature(nvml.TEMPERATURE_GPU)
-                if temp > 90 {
-                    // 温度过高
-                    unhealthy = append(unhealthy, dev.ID)
-                }
-                
-                // 检查 ECC 错误
-                eccErrors, _ := device.GetTotalEccErrors(nvml.MEMORY_ERROR_TYPE_UNCORRECTED, nvml.VOLATILE_ECC)
-                if eccErrors > 0 {
-                    unhealthy = append(unhealthy, dev.ID)
-                }
+    for _, val := range rawNodes {
+        // 遍历所有设备类型
+        for devhandsk, devInstance := range device.GetDevices() {
+            // 1. 获取节点设备信息
+            nodedevices, err := devInstance.GetNodeDevices(*val)
+            if err != nil {
+                continue
             }
             
-            if len(unhealthy) > 0 {
-                // 通知 kubelet 设备不健康
-                m.updateDeviceHealth(unhealthy)
+            // 2. 调用 CheckHealth 检查设备健康状态
+            health, needUpdate := devInstance.CheckHealth(devhandsk, val)
+            
+            // 3. 如果设备不健康，清理节点
+            if !health {
+                klog.Warning("Device is unhealthy, cleaning up node")
+                devInstance.NodeCleanUp(val.Name)
+                s.rmNodeDevices(val.Name, devhandsk)
+                continue
+            }
+            
+            // 4. 如果需要更新，重新读取设备信息
+            if needUpdate {
+                nodeInfo := &device.NodeInfo{
+                    ID:      val.Name,
+                    Node:    val,
+                    Devices: make(map[string][]device.DeviceInfo, 0),
+                }
+                for _, deviceinfo := range nodedevices {
+                    nodeInfo.Devices[deviceinfo.DeviceVendor] = append(nodeInfo.Devices[deviceinfo.DeviceVendor], *deviceinfo)
+                }
+                s.addNode(val.Name, nodeInfo)
             }
         }
     }
 }
 ```
+
+**CheckHealth 的实际实现**（`pkg/device/nvidia/device.go:288`）：
+
+```go
+func (dev *NvidiaGPUDevices) CheckHealth(devType string, n *corev1.Node) (bool, bool) {
+    dev.mu.Lock()
+    defer dev.mu.Unlock()
+    
+    // 1. 获取节点当前上报的 GPU 数量
+    val, ok := n.Status.Allocatable[corev1.ResourceName(dev.config.ResourceCountName)]
+    if !ok {
+        return true, false
+    }
+    current := val.Value()
+    
+    // 2. 获取上次记录的 GPU 数量
+    reported, ok := dev.ReportedGPUNum[n.Name]
+    if !ok {
+        // 首次检查，记录当前数量
+        dev.ReportedGPUNum[n.Name] = current
+        return true, true  // 健康，需要更新
+    }
+    
+    // 3. 检查数量是否变化
+    if current != reported {
+        klog.InfoS("GPU count changed", 
+            "node", n.Name, 
+            "previous", reported, 
+            "current", current)
+        dev.ReportedGPUNum[n.Name] = current
+        return true, true  // 健康，需要更新
+    }
+    
+    // 4. 数量未变化，不需要更新
+    return true, false  // 健康，不需要更新
+}
+```
+
+**健康检查的触发时机**：
+
+Scheduler 的 `RegisterFromNodeAnnotations` 方法会定期触发健康检查：
+
+```go
+func (s *Scheduler) RegisterFromNodeAnnotations() {
+    ticker := time.NewTicker(time.Second * 15)  // 每 15 秒触发一次
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-s.nodeNotify:   // 节点变化事件
+        case <-s.leaderNotify: // 成为 Leader 事件
+        case <-ticker.C:       // 定时触发
+        case <-s.stopCh:
+            return
+        }
+        
+        // 调用 register 方法，其中会调用 CheckHealth
+        s.register(labelSelector, printedLog)
+    }
+}
+```
+
+**健康检查的逻辑**：
+
+1. **检查设备数量变化**：
+   - 读取节点的 `Status.Allocatable["nvidia.com/gpu"]`
+   - 与上次记录的数量对比
+   - 如果数量变化，标记需要更新
+
+2. **不检查设备温度、ECC 错误等**：
+   - HAMi 的 CheckHealth **不使用** NVML 检查设备状态
+   - 只检查 Device Plugin 上报的设备数量
+   - 依赖 Device Plugin 的健康检查机制
+
+3. **返回值含义**：
+   - `(true, false)`: 设备健康，不需要更新
+   - `(true, true)`: 设备健康，需要更新（数量变化或首次检查）
+   - `(false, false)`: 设备不健康，需要清理节点
+
+**为什么不在 Device Plugin 中检查？**
+
+- Device Plugin 有自己的健康检查机制（`ListAndWatch` 方法）
+- Device Plugin 会向 kubelet 上报设备健康状态
+- kubelet 会更新节点的 `Status.Allocatable`
+- Scheduler 只需要检查 `Status.Allocatable` 的变化即可
+
+**Device Plugin 的健康检查**（这才是真正检查设备状态的地方）：
+
+```go
+// pkg/device-plugin/nvidiadevice/nvinternal/rm/health.go
+func (r *resourceManager) CheckHealth(stop <-chan any, unhealthy chan<- *Device, ...) error {
+    // 使用 NVML 检查设备健康状态
+    for {
+        select {
+        case <-stop:
+            return nil
+        case <-time.After(healthCheckInterval):
+            // 检查每个设备
+            for _, device := range r.devices {
+                // 使用 NVML 检查设备状态
+                ret := nvml.DeviceGetHandleByUUID(device.ID)
+                if ret != nvml.SUCCESS {
+                    // 设备不健康，通知 kubelet
+                    unhealthy <- device
+                }
+            }
+        }
+    }
+}
+```
+
+**总结**：
+
+- ✅ **Scheduler 的 CheckHealth**：检查设备数量变化（每 15 秒）
+- ✅ **Device Plugin 的健康检查**：使用 NVML 检查设备状态（持续监控）
+- ✅ **两者配合**：Device Plugin 检测故障 → kubelet 更新 Allocatable → Scheduler 检测变化 → 清理节点
 
 ---
 

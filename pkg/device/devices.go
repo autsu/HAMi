@@ -954,14 +954,53 @@ func GetDevicesUUIDList(infos []*DeviceInfo) []string {
 	return uuids
 }
 
+// CheckHealth 通用的设备健康检查实现（基于 HandshakeAnnos 握手机制）
+// 这是为其他设备类型（如 Hygon DCU）提供的默认实现
+//
+// 注意：NVIDIA 设备有自己的 CheckHealth 实现，不使用这个函数！
+// - NVIDIA: 基于 Status.Allocatable 数量对比（pkg/device/nvidia/device.go:223）
+// - Hygon DCU: 调用此函数，使用 HandshakeAnnos 握手（pkg/device/hygon/device.go:183）
+// - AMD: 简单返回 (true, true)，不做检查（pkg/device/amd/device.go:127）
+//
+// 握手机制工作原理：
+// 1. Scheduler 定期检查节点（每 15 秒）
+// 2. 如果注解为空或其他值，打上 "Requesting_时间戳"
+// 3. Device Plugin 看到 "Requesting" 后，重新上报设备信息并更新注解
+// 4. 如果 60 秒内没响应，认为不健康
+// 5. 如果注解为 "Deleted"，表示设备已下线，跳过检查
+//
+// HandshakeAnnos 的三种状态：
+// - 空或其他值: 首次检查或需要重新握手 → 打上 "Requesting_时间戳"，返回 (true, true)
+// - "Requesting_时间戳": 等待 Device Plugin 响应 → 检查是否超时 60 秒
+//   - 未超时: 返回 (true, false) - 健康但不更新
+//   - 超时: 返回 (false, false) - 不健康，触发清理
+//
+// - "Deleted": 设备已下线 → 返回 (true, false) - 暂时健康但不更新，避免重复清理
+//
+// 为什么需要握手机制？
+// - 协调 Scheduler 和 Device Plugin 之间的通信
+// - 触发 Device Plugin 重新上报设备信息
+// - 检测 Device Plugin 是否响应（超时检测）
+// - 避免重复清理（通过 "Deleted" 状态）
+//
+// 参数：
+// - devType: 设备类型（如 "DCU"）
+// - node: Kubernetes 节点对象
+//
+// 返回值：
+// - 第一个 bool: 设备是否健康
+// - 第二个 bool: 是否需要更新设备信息
 func CheckHealth(devType string, node *corev1.Node) (bool, bool) {
 	handshake := node.Annotations[util.HandshakeAnnos[devType]]
 	if strings.Contains(handshake, "Requesting") {
+		// 情况 1: 正在等待 Device Plugin 响应，检查是否超时（60秒）
 		formertime, _ := time.Parse(time.DateTime, strings.Split(handshake, "_")[1])
 		return time.Now().Before(formertime.Add(time.Second * 60)), false
 	} else if strings.Contains(handshake, "Deleted") {
+		// 情况 2: 设备已标记删除，返回健康但不更新（避免重复清理）
 		return true, false
 	} else {
+		// 情况 3: 首次检查或需要重新握手，打上 "Requesting" 时间戳
 		_, ok := util.HandshakeAnnos[devType]
 		if ok {
 			tmppat := make(map[string]string)
