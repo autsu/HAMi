@@ -69,6 +69,7 @@ func GetNode(nodename string) (*corev1.Node, error) {
 }
 
 func GetPendingPod(ctx context.Context, node string) (*corev1.Pod, error) {
+	// 步骤 1: 优先从节点锁中获取 Pod
 	pod, err := GetAllocatePodByNode(ctx, node)
 	if err != nil {
 		return nil, err
@@ -81,29 +82,36 @@ func GetPendingPod(ctx context.Context, node string) (*corev1.Pod, error) {
 	podListOptions := metav1.ListOptions{
 		FieldSelector: selector,
 	}
+	// 拿到已经调度到这个节点，但还在等待分配设备的 pod（处于 pending 状态）
 	podlist, err := client.GetClient().CoreV1().Pods("").List(ctx, podListOptions)
 	if err != nil {
 		return nil, err
 	}
+	// 步骤 3: 过滤出正在分配设备的 Pod
 	for _, p := range podlist.Items {
+		// 3.1 必须是 Pending 状态
 		if p.Status.Phase != corev1.PodPending {
 			continue
 		}
+		// 3.2 必须有绑定时间注解
 		if _, ok := p.Annotations[BindTimeAnnotations]; !ok {
 			continue
 		}
+		// 3.3 必须有设备绑定阶段注解
 		if phase, ok := p.Annotations[DeviceBindPhase]; !ok {
 			continue
 		} else {
+			// 3.4 设备绑定阶段必须是 "Allocating"
 			if strings.Compare(phase, DeviceBindAllocating) != 0 {
 				continue
 			}
 		}
+		// 3.5 必须有分配节点注解，且匹配当前节点
 		if n, ok := p.Annotations[AssignedNodeAnnotations]; !ok {
 			continue
 		} else {
 			if strings.Compare(n, node) == 0 {
-				return &p, nil
+				return &p, nil // 找到了！
 			}
 		}
 	}

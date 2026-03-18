@@ -157,6 +157,9 @@ type DeviceConfig struct {
 	DebugMode    *bool
 }
 
+var _ device.Devices = &NvidiaGPUDevices{}
+var _ = (device.Devices)(&NvidiaGPUDevices{})
+
 type NvidiaGPUDevices struct {
 	config         NvidiaConfig
 	ReportedGPUNum map[string]int64 // key: nodeName, value: reported GPU count
@@ -214,10 +217,92 @@ func FilterDeviceToRegister(uuid, indexStr string) bool {
 	return false
 }
 
+// NodeCleanUp 清理节点的设备相关注解
+// 当设备不健康时调用，标记 HandshakeAnnos 为 "Deleted"
+//
+// 注意：虽然 NVIDIA 的 CheckHealth 不使用 HandshakeAnnos 握手机制，
+// 但仍然需要标记这个注解，原因：
+// 1. 通知 Device Plugin 设备已被 Scheduler 标记为不健康
+// 2. 与其他设备类型保持一致的清理流程
+// 3. 为未来可能的握手机制预留接口
+//
+// 调用时机：
+// - CheckHealth 返回 (false, false) 时
+// - Scheduler 的 register 方法中检测到设备不健康
+//
+// 参数：
+// - nn: 节点名称
+//
+// 返回值：
+// - error: 更新注解失败时返回错误
 func (dev *NvidiaGPUDevices) NodeCleanUp(nn string) error {
 	return util.MarkAnnotationsToDelete(HandshakeAnnos, nn)
 }
 
+// CheckHealth 检查节点上设备的健康状态和是否需要更新设备信息
+// 这是 Scheduler 定期调用的方法，用于监控设备状态变化
+//
+// 工作原理：
+// 1. 从节点的 Status.Allocatable 中读取当前设备数量（由 Device Plugin 上报）
+// 2. 与上次记录的设备数量（ReportedGPUNum）进行对比
+// 3. 根据对比结果判断设备健康状态和是否需要更新
+//
+// 返回值说明：
+// - 第一个返回值 (health): 设备是否健康
+//   - true: 设备健康或状态正常
+//   - false: 设备异常（设备数量从有变为无）
+//
+// - 第二个返回值 (needUpdate): 是否需要更新设备信息
+//   - true: 设备数量发生变化，需要重新注册设备信息
+//   - false: 设备数量未变化，无需更新
+//
+// 判断逻辑详解：
+//
+// 情况 1: current == 0 && reported == 0
+//
+//	返回: (true, false)
+//	说明: 节点从未有过设备，或者一直没有设备，这是正常状态
+//	行为: 不触发更新，不标记为不健康
+//
+// 情况 2: current == 0 && reported > 0
+//
+//	返回: (false, false)
+//	说明: 设备消失了！可能是 Device Plugin 崩溃、驱动故障、设备被拔出
+//	行为: 标记为不健康，触发节点清理（rmNodeDevices）
+//	为什么不更新？因为设备已经不存在了，没有新信息可以更新
+//
+// 情况 3: current > 0 && reported != current
+//
+//	返回: (true, true)
+//	说明: 设备数量变化（可能是首次初始化、新增设备、或部分设备下线）
+//	行为: 标记为健康，触发设备信息更新（重新读取节点注解）
+//
+// 情况 4: current > 0 && reported == current
+//
+//	返回: (true, false)
+//	说明: 设备数量未变化，一切正常
+//	行为: 标记为健康，无需更新
+//
+// 为什么需要 ReportedGPUNum？
+// - 记录上次检查时的设备数量
+// - 用于检测设备数量的变化
+// - 避免重复的设备信息更新操作
+//
+// 为什么需要互斥锁？
+// - ReportedGPUNum 是共享状态，可能被多个 goroutine 访问
+// - 保证并发安全
+//
+// 调用时机：
+// - Scheduler 的 RegisterFromNodeAnnotations 循环中
+// - 每 15 秒检查一次所有节点
+//
+// 参数：
+// - devType: 设备类型（如 "NVIDIA"）
+// - n: Kubernetes 节点对象
+//
+// 返回值：
+// - bool: 设备是否健康
+// - bool: 是否需要更新设备信息
 func (dev *NvidiaGPUDevices) CheckHealth(devType string, n *corev1.Node) (bool, bool) {
 	current := int64(0)
 	quantity := n.Status.Allocatable.Name(corev1.ResourceName(dev.config.ResourceCountName), resource.DecimalSI)
@@ -233,17 +318,21 @@ func (dev *NvidiaGPUDevices) CheckHealth(devType string, n *corev1.Node) (bool, 
 
 	if current == 0 {
 		if reported == 0 {
+			// 情况 1: 节点从未有过设备，这是正常状态
 			return true, false
 		}
+		// 情况 2: 设备消失了！标记为不健康
 		dev.ReportedGPUNum[n.Name] = current
 		return false, false
 	}
 
 	if reported != current {
+		// 情况 3: 设备数量变化，需要更新
 		dev.ReportedGPUNum[n.Name] = current
 		return true, true
 	}
 
+	// 情况 4: 设备数量未变化，一切正常
 	return true, false
 }
 

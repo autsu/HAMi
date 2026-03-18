@@ -107,12 +107,14 @@ func InitDevicesWithConfig(config *Config) error {
 	// Helper function to initialize devices and handle errors
 	initializeDevice := func(deviceType string, commonWord string, initFunc func(any) (device.Devices, error), config any) {
 		klog.Infof("Initializing %s device", commonWord)
+		// such InitNvidiaDevice()
 		dev, err := initFunc(config)
 		if err != nil {
 			klog.Errorf("Failed to initialize %s device: %v", commonWord, err)
 			initErrors = append(initErrors, fmt.Errorf("%s: %v", commonWord, err))
 			return
 		}
+		// CommonWorld() e.g. NVIDIA
 		device.DevicesMap[dev.CommonWord()] = dev
 		device.DevicesToHandle = append(device.DevicesToHandle, commonWord)
 		klog.Infof("%s device initialized successfully", commonWord)
@@ -132,6 +134,7 @@ func InitDevicesWithConfig(config *Config) error {
 			}
 			return nvidia.InitNvidiaDevice(nvidiaConfig), nil
 		}, config.NvidiaConfig},
+
 		{cambricon.CambriconMLUDevice, cambricon.CambriconMLUCommonWord, func(cfg any) (device.Devices, error) {
 			cambriconConfig, ok := cfg.(cambricon.CambriconConfig)
 			if !ok {
@@ -139,6 +142,7 @@ func InitDevicesWithConfig(config *Config) error {
 			}
 			return cambricon.InitMLUDevice(cambriconConfig), nil
 		}, config.CambriconConfig},
+
 		{hygon.HygonDCUDevice, hygon.HygonDCUCommonWord, func(cfg any) (device.Devices, error) {
 			hygonConfig, ok := cfg.(hygon.HygonConfig)
 			if !ok {
@@ -146,6 +150,7 @@ func InitDevicesWithConfig(config *Config) error {
 			}
 			return hygon.InitDCUDevice(hygonConfig), nil
 		}, config.HygonConfig},
+
 		{enflame.EnflameGCUDevice, enflame.EnflameGCUCommonWord, func(cfg any) (device.Devices, error) {
 			enflameConfig, ok := cfg.(enflame.EnflameConfig)
 			if !ok {
@@ -153,6 +158,7 @@ func InitDevicesWithConfig(config *Config) error {
 			}
 			return enflame.InitGCUDevice(enflameConfig), nil
 		}, config.EnflameConfig},
+
 		{enflame.EnflameVGCUDevice, enflame.EnflameVGCUCommonWord, func(cfg any) (device.Devices, error) {
 			enflameConfig, ok := cfg.(enflame.EnflameConfig)
 			if !ok {
